@@ -1,4 +1,3 @@
--- /gt_register.lua
 local component = require("component")
 local sides     = require("sides")
 local term      = require("term")
