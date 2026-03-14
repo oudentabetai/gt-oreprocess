@@ -26,6 +26,42 @@ local function shortAddr(addr)
   return addr:sub(1,8) .. "..."
 end
 
+-- アドレスリスト（単一文字列またはテーブル）を短縮表示
+local function shortAddrs(v)
+  if not v then return "[ 未設定 ]" end
+  if type(v) == "string" then return shortAddr(v) end
+  if type(v) == "table" then
+    if #v == 0 then return "[ 未設定 ]" end
+    local s = shortAddr(v[1])
+    if #v > 1 then s = s .. "(+" .. (#v - 1) .. "台)" end
+    return s
+  end
+  return "[ 未設定 ]"
+end
+
+-- エントリ内のいずれかのフィールドにアドレスが含まれるか確認
+local function addrInEntry(entry, targetAddr)
+  for _, field in ipairs({"addr", "in_crate", "out_crate"}) do
+    local fv = entry[field]
+    if type(fv) == "string" then
+      if fv == targetAddr then return true end
+    elseif type(fv) == "table" then
+      for _, a in ipairs(fv) do
+        if a == targetAddr then return true end
+      end
+    end
+  end
+  return false
+end
+
+-- フィールドの値を常にリストとして取得
+local function getAddrList(entry, field)
+  local v = entry[field]
+  if not v then return {} end
+  if type(v) == "string" then return {v} end
+  return v
+end
+
 -- ============================================================
 -- ストレージ割り当てモード
 -- ============================================================
@@ -42,14 +78,14 @@ local function storageConfigMode()
       local entry = config[def.key] or {}
       -- input/outputは単体ストレージ、それ以外はin_crate/out_crate
       if def.key == "input" or def.key == "output" then
-        local addr = entry.addr and shortAddr(entry.addr) or "[ 未設定 ]"
-        print(string.format("  [%2d] %-12s %-12s  %s",
-          i, def.key, addr, def.label))
+        local addrDisp = shortAddrs(entry.addr)
+        print(string.format("  [%2d] %-12s %-16s  %s",
+          i, def.key, addrDisp, def.label))
       else
-        local inAddr  = entry.in_crate  and shortAddr(entry.in_crate)  or "[ 未設定 ]"
-        local outAddr = entry.out_crate and shortAddr(entry.out_crate) or "[ 未設定 ]"
-        print(string.format("  [%2d] %-12s in:%-12s out:%-12s  %s",
-          i, def.key, inAddr, outAddr, def.label))
+        local inDisp  = shortAddrs(entry.in_crate)
+        local outDisp = shortAddrs(entry.out_crate)
+        print(string.format("  [%2d] %-12s in:%-16s out:%-16s  %s",
+          i, def.key, inDisp, outDisp, def.label))
       end
     end
 
@@ -104,8 +140,8 @@ local function storageConfigMode()
             printHeader()
             print("割り当て中: " .. def.key .. "." .. slot.field)
             print("  " .. slot.label)
-            local cur = (config[def.key] or {})[slot.field]
-            print("  現在: " .. (cur and shortAddr(cur) or "未設定"))
+            local curList = getAddrList(config[def.key] or {}, slot.field)
+            print("  現在: " .. shortAddrs(#curList > 0 and curList or nil))
             print("")
 
             -- ストレージ一覧
@@ -116,10 +152,8 @@ local function storageConfigMode()
               local usedBy = ""
               for k, e in pairs(config) do
                 if type(e) == "table" then
-                  if e.addr == v.addr or e.in_crate == v.addr or e.out_crate == v.addr then
-                    if k ~= def.key then
-                      usedBy = "  ← " .. k .. " で使用中"
-                    end
+                  if addrInEntry(e, v.addr) and k ~= def.key then
+                    usedBy = "  ← " .. k .. " で使用中"
                   end
                 end
               end
@@ -134,7 +168,7 @@ local function storageConfigMode()
 
             if idx and idx > 0 and invs[idx] then
               if not config[def.key] then config[def.key] = {} end
-              config[def.key][slot.field] = invs[idx].addr
+              config[def.key][slot.field] = { invs[idx].addr }
               gtMachines.save(config)
               print("設定: " .. invs[idx].addr:sub(1,8) .. "...")
               os.sleep(0.4)
@@ -153,7 +187,7 @@ local function storageConfigMode()
       end
 
     else
-      -- 個別割り当て
+      -- 個別割り当て（複数チェスト対応）
       local idx = tonumber(input)
       if not idx or not gtMachines.MACHINE_DEFS[idx] then
         print("[!] 無効な入力です")
@@ -170,38 +204,102 @@ local function storageConfigMode()
         end
 
         for _, f in ipairs(fields) do
-          printHeader()
-          print("割り当て: " .. def.key .. "." .. f.field)
-          print("  " .. f.label)
-          local cur = (config[def.key] or {})[f.field]
-          print("  現在: " .. (cur and shortAddr(cur) or "未設定"))
-          print("")
+          -- 複数アドレス管理UI
+          while true do
+            printHeader()
+            print("割り当て: " .. def.key .. "." .. f.field)
+            print("  " .. f.label)
+            print("")
 
-          print("─── 接続中のストレージ ───")
-          for i, v in ipairs(invs) do
-            local sz = gtInv.size(v.addr) or "?"
-            print(string.format("  [%2d] %-20s slots:%-4s %s",
-              i, v.ctype, sz, v.addr:sub(1,8).."..."))
-          end
-          print("  [0] リセット")
-          print("")
-          io.write("番号 > ")
-          local ans = io.read()
-          local cidx = tonumber(ans)
+            local entry = config[def.key] or {}
+            local current = getAddrList(entry, f.field)
 
-          if cidx == 0 then
-            if config[def.key] then config[def.key][f.field] = nil end
-            gtMachines.save(config)
-            print("リセットしました")
-          elseif cidx and invs[cidx] then
-            if not config[def.key] then config[def.key] = {} end
-            config[def.key][f.field] = invs[cidx].addr
-            gtMachines.save(config)
-            print("設定しました: " .. invs[cidx].addr:sub(1,8) .. "...")
-          else
-            print("[!] 無効な入力です")
+            print("─── 現在の割り当て (" .. #current .. "台) ───")
+            if #current == 0 then
+              print("  (未設定)")
+            else
+              for i, a in ipairs(current) do
+                print(string.format("  [r%d] %s", i, shortAddr(a)))
+              end
+            end
+            print("")
+
+            -- 追加可能なストレージ一覧
+            print("─── 接続中のストレージ（追加可能）───")
+            local available = {}
+            for _, v in ipairs(invs) do
+              local already = false
+              for _, a in ipairs(current) do
+                if a == v.addr then already = true; break end
+              end
+              if not already then
+                table.insert(available, v)
+              end
+            end
+            if #available == 0 then
+              print("  (追加可能なストレージなし)")
+            else
+              for i, v in ipairs(available) do
+                local sz = gtInv.size(v.addr) or "?"
+                local usedBy = ""
+                for k, e in pairs(config) do
+                  if type(e) == "table" then
+                    if addrInEntry(e, v.addr) and k ~= def.key then
+                      usedBy = "  ← " .. k
+                    end
+                  end
+                end
+                print(string.format("  [%2d] %-20s slots:%-4s %s%s",
+                  i, v.ctype, sz, v.addr:sub(1,8).."...", usedBy))
+              end
+            end
+            print("")
+            print("  番号   : ストレージを追加")
+            print("  r<番号>: 割り当てを削除 (例: r1)")
+            print("  [0]    : 全削除")
+            print("  [q]    : 完了")
+            print("")
+            io.write("入力 > ")
+            local ans = io.read()
+
+            if ans == "q" then
+              break
+            elseif ans == "0" then
+              if not config[def.key] then config[def.key] = {} end
+              config[def.key][f.field] = {}
+              gtMachines.save(config)
+              print("全削除しました")
+              os.sleep(0.5)
+            elseif ans:sub(1,1) == "r" then
+              local n = tonumber(ans:sub(2))
+              local cur2 = getAddrList(config[def.key] or {}, f.field)
+              if n and n >= 1 and n <= #cur2 then
+                table.remove(cur2, n)
+                if not config[def.key] then config[def.key] = {} end
+                config[def.key][f.field] = cur2
+                gtMachines.save(config)
+                print("削除しました")
+                os.sleep(0.5)
+              else
+                print("[!] 無効な番号です")
+                os.sleep(0.5)
+              end
+            else
+              local n = tonumber(ans)
+              if n and n >= 1 and available[n] then
+                local cur2 = getAddrList(config[def.key] or {}, f.field)
+                table.insert(cur2, available[n].addr)
+                if not config[def.key] then config[def.key] = {} end
+                config[def.key][f.field] = cur2
+                gtMachines.save(config)
+                print("追加しました: " .. available[n].addr:sub(1,8) .. "...")
+                os.sleep(0.5)
+              else
+                print("[!] 無効な入力です")
+                os.sleep(0.5)
+              end
+            end
           end
-          os.sleep(1)
         end
       end
     end
@@ -248,7 +346,8 @@ end
 local function registerItem(routes)
   local config = gtMachines.load()
   local inputEntry = config["input"]
-  if not inputEntry or not inputEntry.addr then
+  local inputAddrs = inputEntry and getAddrList(inputEntry, "addr") or {}
+  if #inputAddrs == 0 then
     print("[!] 投入ストレージが未設定です。先に [s] で設定してください")
     os.sleep(2)
     return
@@ -256,15 +355,18 @@ local function registerItem(routes)
 
   printHeader()
   print("投入ストレージにアイテムを1種類入れてEnterを押してください")
-  print("(" .. inputEntry.addr .. ")")
+  print("(" .. table.concat(inputAddrs, ", ") .. ")")
   io.write("> ")
   io.read()
 
-  -- スキャン
+  -- スキャン（複数アドレス対応）
   local found = nil
-  gtInv.scan(inputEntry.addr, function(slot, item)
-    if not found then found = item end
-  end)
+  for _, inputAddr in ipairs(inputAddrs) do
+    gtInv.scan(inputAddr, function(slot, item)
+      if not found then found = item end
+    end)
+    if found then break end
+  end
 
   if not found then
     print("[!] ストレージが空です")
