@@ -1,58 +1,12 @@
 -- /gt_processor.lua
-local component = require("component")
-local sides     = require("sides")
-local os        = require("os")
-local gtRoutes  = require("gt_routes")
-
-local inv = component.inventory_controller
-
-local C = {
-  input          = sides.north,
-
-  mac1_in        = sides.south,   -- Macerator#1 入力  (Ore → Crushed)
-  mac1_out       = sides.east,    -- Macerator#1 出力
-
-  mac2_in        = sides.west,    -- Macerator#2 入力  (Crushed → ImpureDust)
-  mac2_out       = sides.up,      -- Macerator#2 出力
-
-  mac3_in        = sides.down,    -- Macerator#3 入力  (ImpureDust → Dust)
-  mac3_out       = sides.north,   -- Macerator#3 出力
-
-  cent_mac_in    = sides.south,   -- Centrifuge入力    [mac + use_centrifuge]
-  cent_mac_out   = sides.east,    -- Centrifuge出力
-
-  wash_in        = sides.west,    -- OreWasher 入力
-  wash_out       = sides.up,      -- OreWasher 出力
-
-  mac4_in        = sides.down,    -- Macerator#4 入力  (PurifiedOre → Dust)
-  mac4_out       = sides.north,   -- Macerator#4 出力
-
-  cent_wash_in   = sides.south,   -- Centrifuge入力    [wash + use_centrifuge]
-  cent_wash_out  = sides.east,    -- Centrifuge出力
-
-  therm_in       = sides.west,    -- ThermalCentrifuge 入力
-  therm_out      = sides.up,      -- ThermalCentrifuge 出力
-
-  mac5_in        = sides.down,    -- Macerator#5 入力  (Centrifuged → Dust)
-  mac5_out       = sides.north,   -- Macerator#5 出力
-
-  output         = sides.south,
-}
+local os         = require("os")
+local gtRoutes   = require("gt_routes")
+local gtMachines = require("gt_machines")
+local gtInv      = require("gt_inv")
 
 -- ============================================================
--- ユーティリティ
+-- 鉱石逆引き
 -- ============================================================
-local function moveAll(from, to)
-  local size = inv.getInventorySize(from)
-  if not size then return end
-  for slot = 1, size do
-    local item = inv.getStackInSlot(from, slot)
-    if item then
-      inv.transferItem(from, to, item.size, slot)
-    end
-  end
-end
-
 local function extractMetal(oreName)
   return oreName:match("ore_(.-)_?%d*$")
       or oreName:match(":(.+)_ore$")
@@ -61,9 +15,7 @@ local function extractMetal(oreName)
 end
 
 local function findInfo(itemName, routes)
-  -- 直接一致（生鉱石）
   if routes[itemName] then return routes[itemName] end
-  -- 中間品から逆引き
   for oreName, info in pairs(routes) do
     local metal = extractMetal(oreName)
     if metal and itemName:lower():find(metal:lower(), 1, true) then
@@ -74,119 +26,145 @@ local function findInfo(itemName, routes)
 end
 
 -- ============================================================
+-- アドレス取得ヘルパー
+-- ============================================================
+local function addr(config, key, field)
+  local e = config[key]
+  if not e then return nil end
+  return e[field] or e.addr
+end
+
+-- ============================================================
 -- 搬送ステージ
 -- ============================================================
 
--- Stage1: 入力チェスト → Mac#1
-local function stage1(routes)
-  local size = inv.getInventorySize(C.input)
-  if not size then return end
-  for slot = 1, size do
-    local item = inv.getStackInSlot(C.input, slot)
-    if item then
-      if routes[item.name] then
-        inv.transferItem(C.input, C.mac1_in, item.size, slot)
-      else
-        print("[未登録] " .. item.name)
-      end
+-- Stage1: 投入ストレージ → Mac#1 入力crate
+-- 登録済みの鉱石だけ転送
+local function stage1(routes, C)
+  local src = addr(C, "input", "addr")
+  local dst = addr(C, "mac1", "in_crate")
+  if not src or not dst then return end
+
+  gtInv.scan(src, function(slot, item)
+    if routes[item.name] then
+      gtInv.transfer(src, slot, dst, item.count)
+    else
+      print("[未登録] " .. item.name)
     end
-  end
+  end)
 end
 
--- Stage2: Crushed* → 各ルートの第1機械へ
-local function stage2(routes)
-  local size = inv.getInventorySize(C.mac1_out)
-  if not size then return end
-  for slot = 1, size do
-    local item = inv.getStackInSlot(C.mac1_out, slot)
-    if item then
+-- Stage2: Mac#1 出力crate → ルート別入力crateへ振り分け
+local function stage2(routes, C)
+  local src = addr(C, "mac1", "out_crate")
+  if not src then return end
+
+  gtInv.scan(src, function(slot, item)
+    local info = findInfo(item.name, routes)
+    if not info then
+      print("[振り分け不明] " .. item.name)
+      return
+    end
+    local destKey = "mac2"
+    if info.route == "wash"    then destKey = "wash"
+    elseif info.route == "thermal" then destKey = "therm" end
+
+    local dst = addr(C, destKey, "in_crate")
+    if dst then
+      gtInv.transfer(src, slot, dst, item.count)
+    end
+  end)
+end
+
+-- Stage3: 各第1処理機械の出力crate → 次ステージへ
+local function stage3(routes, C)
+  -- [mac] Mac#2出力 → Mac#3入力 or 完成ストレージ
+  local mac2out = addr(C, "mac2", "out_crate")
+  if mac2out then
+    gtInv.scan(mac2out, function(slot, item)
       local info = findInfo(item.name, routes)
-      if info then
-        local dest = C.mac2_in
-        if info.route == "wash"    then dest = C.wash_in
-        elseif info.route == "thermal" then dest = C.therm_in end
-        inv.transferItem(C.mac1_out, dest, item.size, slot)
+      local dst
+      if info and not info.skip_mac2 then
+        dst = addr(C, "mac3", "in_crate")
       else
-        print("[振り分け不明] " .. item.name)
+        dst = addr(C, "output", "addr")
       end
-    end
+      if dst then gtInv.transfer(mac2out, slot, dst, item.count) end
+    end)
+  end
+
+  -- [wash] OreWasher出力 → Mac#4入力 or 完成ストレージ
+  local washout = addr(C, "wash", "out_crate")
+  if washout then
+    gtInv.scan(washout, function(slot, item)
+      local info = findInfo(item.name, routes)
+      local dst
+      if info and not info.skip_mac_after_wash then
+        dst = addr(C, "mac4", "in_crate")
+      else
+        dst = addr(C, "output", "addr")
+      end
+      if dst then gtInv.transfer(washout, slot, dst, item.count) end
+    end)
+  end
+
+  -- [thermal] ThermalCentrifuge出力 → Mac#5入力（固定）
+  local thermout = addr(C, "therm", "out_crate")
+  local mac5in   = addr(C, "mac5", "in_crate")
+  if thermout and mac5in then
+    gtInv.moveAll(thermout, mac5in)
   end
 end
 
--- Stage3: 各第1機械の出力 → 次へ
-local function stage3(routes)
-  -- [mac] ImpureDust → Mac#3 or 出力（skip_mac2フラグで分岐）
-  local s = inv.getInventorySize(C.mac2_out)
-  if s then
-    for slot = 1, s do
-      local item = inv.getStackInSlot(C.mac2_out, slot)
-      if item then
-        local info = findInfo(item.name, routes)
-        local dest = C.output
-        if info and not info.skip_mac2 then
-          dest = C.mac3_in
-        end
-        inv.transferItem(C.mac2_out, dest, item.size, slot)
+-- Stage4: 各最終Mac出力crate → Centrifuge入力 or 完成ストレージ
+local function stage4(routes, C)
+  local output = addr(C, "output", "addr")
+
+  -- [mac] Mac#3出力
+  local mac3out = addr(C, "mac3", "out_crate")
+  if mac3out then
+    gtInv.scan(mac3out, function(slot, item)
+      local info = findInfo(item.name, routes)
+      local dst
+      if info and info.use_centrifuge then
+        dst = addr(C, "cent_mac", "in_crate")
+      else
+        dst = output
       end
-    end
+      if dst then gtInv.transfer(mac3out, slot, dst, item.count) end
+    end)
   end
 
-  -- [wash] PurifiedOre → Mac#4 or 出力（skip_mac_after_washフラグで分岐）
-  local s2 = inv.getInventorySize(C.wash_out)
-  if s2 then
-    for slot = 1, s2 do
-      local item = inv.getStackInSlot(C.wash_out, slot)
-      if item then
-        local info = findInfo(item.name, routes)
-        local dest = C.output
-        if info and not info.skip_mac_after_wash then
-          dest = C.mac4_in
-        end
-        inv.transferItem(C.wash_out, dest, item.size, slot)
+  -- [wash] Mac#4出力
+  local mac4out = addr(C, "mac4", "out_crate")
+  if mac4out then
+    gtInv.scan(mac4out, function(slot, item)
+      local info = findInfo(item.name, routes)
+      local dst
+      if info and info.use_centrifuge then
+        dst = addr(C, "cent_wash", "in_crate")
+      else
+        dst = output
       end
-    end
+      if dst then gtInv.transfer(mac4out, slot, dst, item.count) end
+    end)
   end
 
-  -- [thermal] Centrifuged → Mac#5（固定）
-  moveAll(C.therm_out, C.mac5_in)
+  -- [thermal] Mac#5出力 → 完成ストレージ（固定）
+  local mac5out = addr(C, "mac5", "out_crate")
+  if mac5out and output then
+    gtInv.moveAll(mac5out, output)
+  end
 end
 
--- Stage4: 各最終Mac出力 → Centrifuge or 完成
-local function stage4(routes)
-  -- [mac] Dust
-  local s = inv.getInventorySize(C.mac3_out)
-  if s then
-    for slot = 1, s do
-      local item = inv.getStackInSlot(C.mac3_out, slot)
-      if item then
-        local info = findInfo(item.name, routes)
-        local dest = (info and info.use_centrifuge) and C.cent_mac_in or C.output
-        inv.transferItem(C.mac3_out, dest, item.size, slot)
-      end
-    end
+-- Stage5: Centrifuge出力crate → 完成ストレージ
+local function stage5(C)
+  local output = addr(C, "output", "addr")
+  if not output then return end
+  for _, key in ipairs({"cent_mac", "cent_wash"}) do
+    local src = addr(C, key, "out_crate")
+    if src then gtInv.moveAll(src, output) end
   end
-
-  -- [wash] Dust
-  local s2 = inv.getInventorySize(C.mac4_out)
-  if s2 then
-    for slot = 1, s2 do
-      local item = inv.getStackInSlot(C.mac4_out, slot)
-      if item then
-        local info = findInfo(item.name, routes)
-        local dest = (info and info.use_centrifuge) and C.cent_wash_in or C.output
-        inv.transferItem(C.mac4_out, dest, item.size, slot)
-      end
-    end
-  end
-
-  -- [thermal] Dust → 出力（固定）
-  moveAll(C.mac5_out, C.output)
-end
-
--- Stage5: Centrifuge出力 → 完成
-local function stage5()
-  moveAll(C.cent_mac_out,  C.output)
-  moveAll(C.cent_wash_out, C.output)
 end
 
 -- ============================================================
@@ -196,26 +174,31 @@ print("╔═══════════════════════�
 print("║  GregTech 鉱石処理システム 起動       ║")
 print("╚═══════════════════════════════════════╝")
 print("停止: Ctrl+T")
+print("")
 
 local tick = 0
 while true do
   local routes = gtRoutes.load()
+  local C      = gtMachines.load()
 
   if tick == 0 then
-    local count = 0
-    for _ in pairs(routes) do count = count + 1 end
-    print("登録済み: " .. count .. " 種類")
+    local rc, mc = 0, 0
+    for _ in pairs(routes) do rc = rc + 1 end
+    for _ in pairs(C)      do mc = mc + 1 end
+    print("登録済み鉱石: " .. rc .. " 種類 / 割り当て済みストレージ: " .. mc .. " 台")
   end
 
   local ok, err = pcall(function()
-    stage1(routes)
-    stage2(routes)
-    stage3(routes)
-    stage4(routes)
-    stage5()
+    stage1(routes, C)
+    stage2(routes, C)
+    stage3(routes, C)
+    stage4(routes, C)
+    stage5(C)
   end)
 
-  if not ok then print("[エラー] " .. tostring(err)) end
+  if not ok then
+    print("[エラー] " .. tostring(err))
+  end
 
   tick = tick + 1
   os.sleep(1)
